@@ -27,7 +27,7 @@ echo "Starting backup jobs -  `date +%Y-%m-%d-%H:%M:%S`" >> ${LOGFILE}
 echo "====================================================================================================" >> ${LOGFILE}
 time local_backup
 time remote_data-1_backup
-time remote_data-1_backup
+time remote_data-2_backup
 echo "====================================================================================================" >> ${LOGFILE}
 echo "End backup jobs  -  `date +%Y-%m-%d-%H:%M:%S`" >> ${LOGFILE}
 echo "====================================================================================================" >> ${LOGFILE}
