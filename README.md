@@ -69,6 +69,17 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 ---
 
+**Alternative: personal user crontab.** If you prefer, run `crontab -e` and add:
+
+```
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+0 2 * * *  /usr/local/bin/backup-data --quiet
+```
+
+(No user field — personal crontabs always run as their owner.)
+
 ## Usage
 
 ### Synopsis
