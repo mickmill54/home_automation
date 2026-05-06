@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+#
+# backup-data — back up /data-1 and /data-2 to local /data-3 and to remote host
+#
+# Designed to follow Command Line Interface Guidelines (clig.dev).
+# Run with --help for usage.
+#
+
+set -u           # treat unset variables as errors
+set -o pipefail  # pipelines fail if any stage fails
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+readonly PROG_NAME="backup-data"
+readonly PROG_VERSION="2.0.0"
+
+# ---------------------------------------------------------------------------
+# Defaults (overridable via flags or environment)
+# ---------------------------------------------------------------------------
+LOG_DIR="${BACKUP_LOG_DIR:-/home/mick/logs}"
+LOG_RETENTION_DAYS="${BACKUP_LOG_RETENTION_DAYS:-30}"
+REMOTE_HOST="${BACKUP_REMOTE_HOST:-mick@10.1.1.30}"
+LOCK_FILE="${BACKUP_LOCK_FILE:-/var/lock/backup-data.lock}"
+
+# Source/destination pairs — easy to add more or override
+SOURCES=(
+  "/data-1"
+  "/data-2"
+)
+LOCAL_DEST_BASE="/data-3"
+
+# ---------------------------------------------------------------------------
+# Runtime flags
+# ---------------------------------------------------------------------------
+VERBOSITY=1       # 0=quiet, 1=normal, 2=verbose
+DRY_RUN=0
+SKIP_LOCAL=0
+SKIP_REMOTE=0
+NO_COLOR=0
+LOG_FILE=""       # set later in setup_logging
+
+# Color variables — initialized empty so output helpers are safe to call
+# before setup_colors() runs (e.g., during early arg-parse errors).
+# setup_colors() will populate them with ANSI codes if appropriate.
+C_RESET=""
+C_BOLD=""
+C_RED=""
+C_YELLOW=""
+C_GREEN=""
+C_BLUE=""
+C_DIM=""
+
+# ---------------------------------------------------------------------------
+# Color handling — respects NO_COLOR env var and TTY detection
+# https://no-color.org
+# ---------------------------------------------------------------------------
+setup_colors() {
+  # Disable color if:
+  #   - NO_COLOR env var set (any value)
+  #   - --no-color flag passed
+  #   - stderr is not a terminal
+  #   - TERM is dumb or unset
+  if [[ -n "${NO_COLOR:-}" ]] || [[ $NO_COLOR -eq 1 ]] \
+     || [[ ! -t 2 ]] \
+     || [[ "${TERM:-dumb}" == "dumb" ]]; then
+    return  # leave the empty defaults in place
+  fi
+
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_RED=$'\033[31m'
+  C_YELLOW=$'\033[33m'
+  C_GREEN=$'\033[32m'
+  C_BLUE=$'\033[34m'
+  C_DIM=$'\033[2m'
+}
+
+# ---------------------------------------------------------------------------
+# Output helpers
+#
+# clig.dev: messaging goes to stderr; only data goes to stdout.
+# This script produces no machine-readable data, so everything is stderr-bound.
+# Log file capture handles persistence; stderr handles human display.
+# ---------------------------------------------------------------------------
+msg()   { [[ $VERBOSITY -ge 1 ]] && printf '%s\n' "$*" >&2; }
+info()  { [[ $VERBOSITY -ge 1 ]] && printf '%s%s%s\n' "$C_BLUE" "$*" "$C_RESET" >&2; }
+ok()    { [[ $VERBOSITY -ge 1 ]] && printf '%s✓ %s%s\n' "$C_GREEN" "$*" "$C_RESET" >&2; }
+warn()  { printf '%s%s: warning:%s %s\n' "$C_YELLOW" "$PROG_NAME" "$C_RESET" "$*" >&2; }
+err()   { printf '%s%s: error:%s %s\n' "$C_RED$C_BOLD" "$PROG_NAME" "$C_RESET" "$*" >&2; }
+debug() { [[ $VERBOSITY -ge 2 ]] && printf '%s[debug]%s %s\n' "$C_DIM" "$C_RESET" "$*" >&2; }
+
+# Die with an error message and exit code (defaults to 1)
+die() {
+  local code="${2:-1}"
+  err "$1"
+  exit "$code"
+}
+
+# ---------------------------------------------------------------------------
+# Help and version
+# ---------------------------------------------------------------------------
+print_version() {
+  printf '%s %s\n' "$PROG_NAME" "$PROG_VERSION"
+}
+
+print_help() {
+  cat <<EOF
+${C_BOLD}NAME${C_RESET}
+    ${PROG_NAME} - back up /data-1 and /data-2 to local and remote destinations
+
+${C_BOLD}SYNOPSIS${C_RESET}
+    ${PROG_NAME} [OPTIONS]
+    ${PROG_NAME} --help
+    ${PROG_NAME} --version
+
+${C_BOLD}DESCRIPTION${C_RESET}
+    Synchronizes /data-1 and /data-2 to a local backup pool (/data-3) and to a
+    remote host (default: ${REMOTE_HOST}). Designed to be run interactively
+    with progress visible on the terminal, or non-interactively from cron with
+    output going to a timestamped log file.
+
+    All status messages are written to stderr and to the log file. The script
+    exits 0 on success, 1 if any rsync failed, or 2 on bad invocation.
+
+${C_BOLD}OPTIONS${C_RESET}
+    -n, --dry-run          Show what would be transferred without doing it.
+                           Passes --dry-run to rsync.
+    -v, --verbose          More detailed output (debug-level messages).
+                           Repeat (-vv) for even more.
+    -q, --quiet            Suppress informational output. Errors still print.
+        --no-local         Skip the local backup to /data-3.
+        --no-remote        Skip the remote backup to ${REMOTE_HOST}.
+        --no-color         Disable colored output. (Also honors \$NO_COLOR.)
+        --log-dir DIR      Override log directory (default: ${LOG_DIR}).
+        --remote-host HOST Override remote host (default: ${REMOTE_HOST}).
+                           Format: user@host
+    -h, --help             Show this help and exit.
+    -V, --version          Show version and exit.
+
+${C_BOLD}ENVIRONMENT${C_RESET}
+    BACKUP_LOG_DIR              Default for --log-dir
+    BACKUP_LOG_RETENTION_DAYS   Days to keep old logs (default: 30)
+    BACKUP_REMOTE_HOST          Default for --remote-host
+    BACKUP_LOCK_FILE            Lock file path (default: ${LOCK_FILE})
+    NO_COLOR                    Disable color output (any value)
+
+${C_BOLD}EXIT STATUS${C_RESET}
+    0   All backups succeeded
+    1   One or more backups failed
+    2   Invalid arguments or precondition failure (e.g., already running)
+
+${C_BOLD}EXAMPLES${C_RESET}
+    Run a normal backup with output on the terminal:
+        ${PROG_NAME}
+
+    Run from cron (output to log only, no color):
+        0 2 * * *  /usr/local/bin/${PROG_NAME} --quiet
+
+    Preview what would be transferred without changing anything:
+        ${PROG_NAME} --dry-run --verbose
+
+    Skip remote backup (only sync to local /data-3):
+        ${PROG_NAME} --no-remote
+
+    Use a different remote host:
+        ${PROG_NAME} --remote-host backup@nas.local
+
+${C_BOLD}FILES${C_RESET}
+    ${LOG_DIR}/${PROG_NAME}-YYYY-MM-DD-HHMMSS.log
+        Per-run log file. Pruned after ${LOG_RETENTION_DAYS} days.
+
+    ${LOCK_FILE}
+        Lock file preventing concurrent runs.
+
+${C_BOLD}REPORTING BUGS${C_RESET}
+    File an issue or hit up Mick.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+#
+# clig.dev: support both short (-n) and long (--dry-run) forms. -- terminates
+# options. Bad usage exits 2 with a hint about --help.
+# ---------------------------------------------------------------------------
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--dry-run)     DRY_RUN=1; shift ;;
+      -v|--verbose)     VERBOSITY=2; shift ;;
+      -vv)              VERBOSITY=3; shift ;;
+      -q|--quiet)       VERBOSITY=0; shift ;;
+      --no-local)       SKIP_LOCAL=1; shift ;;
+      --no-remote)      SKIP_REMOTE=1; shift ;;
+      --no-color)       NO_COLOR=1; shift ;;
+      --log-dir)
+        [[ $# -lt 2 ]] && die "--log-dir requires an argument" 2
+        LOG_DIR="$2"
+        shift 2
+        ;;
+      --log-dir=*)      LOG_DIR="${1#*=}"; shift ;;
+      --remote-host)
+        [[ $# -lt 2 ]] && die "--remote-host requires an argument" 2
+        REMOTE_HOST="$2"
+        shift 2
+        ;;
+      --remote-host=*)  REMOTE_HOST="${1#*=}"; shift ;;
+      -h|--help)        print_help; exit 0 ;;
+      -V|--version)     print_version; exit 0 ;;
+      --)               shift; break ;;
+      -*)
+        err "unknown option: $1"
+        msg "Try '$PROG_NAME --help' for more information."
+        exit 2
+        ;;
+      *)
+        err "unexpected argument: $1"
+        msg "Try '$PROG_NAME --help' for more information."
+        exit 2
+        ;;
+    esac
+  done
+
+  if [[ $SKIP_LOCAL -eq 1 ]] && [[ $SKIP_REMOTE -eq 1 ]]; then
+    die "--no-local and --no-remote together would do nothing" 2
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Preflight: verify dependencies and paths
+# ---------------------------------------------------------------------------
+preflight() {
+  local cmd
+  for cmd in rsync flock find date; do
+    command -v "$cmd" >/dev/null 2>&1 \
+      || die "required command not found: $cmd"
+  done
+
+  if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
+    die "cannot create log directory: $LOG_DIR"
+  fi
+
+  if [[ ! -w "$LOG_DIR" ]]; then
+    die "log directory is not writable: $LOG_DIR"
+  fi
+
+  local src
+  for src in "${SOURCES[@]}"; do
+    [[ -d "$src" ]] || die "source directory does not exist: $src"
+  done
+
+  if [[ $SKIP_LOCAL -eq 0 ]] && [[ ! -d "$LOCAL_DEST_BASE" ]]; then
+    die "local destination does not exist: $LOCAL_DEST_BASE"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Single-instance lock
+# ---------------------------------------------------------------------------
+acquire_lock() {
+  exec 9>"$LOCK_FILE" 2>/dev/null || die "cannot open lock file: $LOCK_FILE"
+  if ! flock -n 9; then
+    die "another instance is already running (lock: $LOCK_FILE)" 2
+  fi
+  debug "acquired lock: $LOCK_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Logging setup
+#
+# We always write to a log file. If stderr is a TTY (interactive run), we
+# additionally tee status messages to the terminal. The detection happens
+# implicitly through the output helpers — they write to fd 2, which we
+# redirect appropriately based on TTY status.
+# ---------------------------------------------------------------------------
+setup_logging() {
+  local timestamp
+  timestamp=$(date "+%Y-%m-%d-%H%M%S")
+  LOG_FILE="${LOG_DIR}/${PROG_NAME}-${timestamp}.log"
+
+  if [[ -t 2 ]]; then
+    # Interactive: stderr goes to both terminal and log file
+    exec 2> >(tee -a "$LOG_FILE" >&2)
+  else
+    # Non-interactive (cron): stderr goes only to log file
+    exec 2>>"$LOG_FILE"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup on exit
+# ---------------------------------------------------------------------------
+cleanup() {
+  local rc=$?
+  prune_old_logs
+  exit $rc
+}
+
+prune_old_logs() {
+  local pruned
+  pruned=$(find "$LOG_DIR" -maxdepth 1 \
+                            -name "${PROG_NAME}-*.log" \
+                            -type f \
+                            -mtime "+${LOG_RETENTION_DAYS}" \
+                            -print -delete 2>/dev/null \
+            | wc -l)
+  if [[ $pruned -gt 0 ]]; then
+    debug "pruned $pruned old log file(s) from $LOG_DIR"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# rsync wrapper
+#
+# Returns rsync's exit code. Errors visible in log via stderr capture.
+# ---------------------------------------------------------------------------
+build_rsync_opts() {
+  local -a opts=(-ah)  # archive + human-readable
+
+  if [[ $VERBOSITY -ge 2 ]]; then
+    opts+=(-v --info=progress2,stats2)
+  elif [[ $VERBOSITY -eq 1 ]]; then
+    opts+=(--info=progress2,stats1)
+  else
+    # quiet: no progress, no per-file output
+    opts+=(--info=stats1)
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    opts+=(--dry-run)
+  fi
+
+  printf '%s\n' "${opts[@]}"
+}
+
+run_rsync() {
+  local label="$1"
+  local src="$2"
+  local dst="$3"
+  local -a opts
+  mapfile -t opts < <(build_rsync_opts)
+
+  info "Starting: $label"
+  debug "rsync ${opts[*]} $src $dst"
+
+  local start=$SECONDS
+  rsync "${opts[@]}" "$src" "$dst"
+  local rc=$?
+  local elapsed=$((SECONDS - start))
+
+  if [[ $rc -eq 0 ]]; then
+    ok "Completed: $label (${elapsed}s)"
+  else
+    err "Failed: $label (exit $rc, ${elapsed}s)"
+  fi
+  return $rc
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+run_backups() {
+  local overall_rc=0
+  local total_start=$SECONDS
+
+  info "$PROG_NAME $PROG_VERSION on $(hostname) — log: $LOG_FILE"
+  [[ $DRY_RUN -eq 1 ]] && warn "DRY RUN — no files will be modified"
+
+  if [[ $SKIP_LOCAL -eq 0 ]]; then
+    local src
+    for src in "${SOURCES[@]}"; do
+      local name
+      name=$(basename "$src")
+      local dst="${LOCAL_DEST_BASE}/${name}/"
+      mkdir -p "$dst" || { err "cannot create $dst"; overall_rc=1; continue; }
+      run_rsync "local: $src -> $dst" "$src/" "$dst" || overall_rc=1
+    done
+  else
+    info "Skipping local backup (--no-local)"
+  fi
+
+  if [[ $SKIP_REMOTE -eq 0 ]]; then
+    local src
+    for src in "${SOURCES[@]}"; do
+      local name
+      name=$(basename "$src")
+      local dst="${REMOTE_HOST}:${src}/"
+      run_rsync "remote: $src -> $dst" "$src/" "$dst" || overall_rc=1
+    done
+  else
+    info "Skipping remote backup (--no-remote)"
+  fi
+
+  local total_elapsed=$((SECONDS - total_start))
+  local mins=$((total_elapsed / 60))
+  local secs=$((total_elapsed % 60))
+
+  if [[ $overall_rc -eq 0 ]]; then
+    ok "All backups succeeded in ${mins}m ${secs}s"
+  else
+    err "One or more backups failed (total time: ${mins}m ${secs}s)"
+  fi
+
+  return $overall_rc
+}
+
+main() {
+  setup_colors    # so help/error output is colored when appropriate
+  parse_args "$@"
+  setup_colors    # re-run in case --no-color was passed
+  preflight
+  acquire_lock
+  setup_logging
+  trap cleanup EXIT
+  run_backups
+}
+
+main "$@"
